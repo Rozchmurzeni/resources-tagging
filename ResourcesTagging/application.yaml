@@ -1,0 +1,179 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+
+Resources:
+  SendEventLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: ResourcesTagging::ResourcesTagging.Functions.SendEventLambda::InvokeAsync
+      Role: !GetAtt SendEventLambdaRole.Arn
+
+  ReceiveEventLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: ResourcesTagging::ResourcesTagging.Functions.ReceiveEventLambda::InvokeAsync
+      Role: !GetAtt ReceiveEventLambdaRole.Arn
+      Events:
+        SqsEvent:
+          Type: SQS
+          Properties:
+            BatchSize: 1
+            Queue: !GetAtt Queue.Arn
+
+  Queue:
+    Type: AWS::SQS::Queue
+
+  SendEventLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${SendEventLambda}
+
+  ReceiveEventLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ReceiveEventLambda}
+
+  SendEventLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Policies:
+        - PolicyName: allowToUseSqs
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt Queue.Arn
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service: lambda.amazonaws.com
+
+  ReceiveEventLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Policies:
+        - PolicyName: allowToUseSqs
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt Queue.Arn
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service: lambda.amazonaws.com
+
+  QueuePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ReceiveEventLambda.Arn
+      Principal: sqs.amazonaws.com
+      Action: lambda:InvokeFunction
+      SourceArn: !GetAtt Queue.Arn
+
+  QueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref Queue
+      PolicyDocument:
+        Id: !Sub ${AWS::StackName}-queue-policy
+        Statement:
+          - Sid: Allow receive message
+            Effect: Allow
+            Principal: "*"
+            Action: SQS:ReceiveMessage
+            Resource: !GetAtt Queue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt ReceiveEventLambda.Arn
+          - Sid: Allow send message
+            Effect: Allow
+            Principal: "*"
+            Action: SQS:SendMessage
+            Resource: !GetAtt Queue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn:
+                  - !GetAtt SendEventLambda.Arn
+
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      LoggingConfiguration:
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+        Level: ALL
+        IncludeExecutionData: true
+      DefinitionString: !Sub |-
+        {
+          "StartAt": "FirstState",
+          "States": {
+            "FirstState": {
+              "Type": "Task",
+              "Resource": "${SendEventLambda.Arn}",
+              "End": true
+            }
+          }
+        }
+      RoleArn: !GetAtt StatesExecutionRole.Arn
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/states/${AWS::StackName}-StateMachine
+
+  StatesExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Policies:
+        - PolicyName: allowToInvokeFunction
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt SendEventLambda.Arn
+        - PolicyName: allowToLog
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  # https://docs.aws.amazon.com/step-functions/latest/dg/cw-logs.html
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service: !Sub states.${AWS::Region}.amazonaws.com
+
+Globals:
+  Function:
+    Runtime: dotnetcore3.1
+    CodeUri: bin/Release/netcoreapp3.1/publish
+    MemorySize: 1536
+    Timeout: 30
+    Environment:
+      Variables:
+        StackName: !Sub ${AWS::StackName}
+        QueueUrl: !Ref Queue
